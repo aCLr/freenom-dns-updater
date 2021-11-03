@@ -85,7 +85,7 @@ func (p *Provider) login(ctx context.Context) error {
 
 func (p *Provider) getRecords(ctx context.Context, searchDomain string) ([]libdns.Record, error) {
 
-	recordsDoc, err := p.getRecordsSelection(ctx, searchDomain)
+	recordsDoc, _, err := p.getRecordsSelection(ctx, searchDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +109,7 @@ func (p *Provider) getRecords(ctx context.Context, searchDomain string) ([]libdn
 			Type:  typ,
 			Name:  name,
 			Value: value,
+			ID:    strconv.Itoa(i),
 			TTL:   time.Second * time.Duration(ttl),
 		}
 	}
@@ -116,28 +117,35 @@ func (p *Provider) getRecords(ctx context.Context, searchDomain string) ([]libdn
 	return records, nil
 }
 
-func (p *Provider) getRecordsSelection(ctx context.Context, searchDomain string) (*goquery.Document, error) {
-	// FIXME: login only if need
-	if err := p.login(ctx); err != nil {
-		return nil, err
+// TODO
+func (p *Provider) loginIfNeed(ctx context.Context) error {
+	return p.login(ctx)
+}
+
+func (p *Provider) getRecordsSelection(ctx context.Context, searchDomain string) (*goquery.Document, string, error) {
+	if err := p.loginIfNeed(ctx); err != nil {
+		return nil, "", err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://my.freenom.com/clientarea.php?action=domains", nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	resp, err := client.Do(req)
 	defer resp.Body.Close()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	domainsDoc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
 
 	domains := domainsDoc.Find("table .second > a").Nodes
 	if len(domains) == 0 {
-		return nil, errors.New("table rows not found")
+		return nil, "", errors.New("table rows not found")
 	}
 
 	var manageLink string
@@ -151,27 +159,200 @@ func (p *Provider) getRecordsSelection(ctx context.Context, searchDomain string)
 	}
 
 	if manageLink == "" {
-		return nil, errors.New("manage link not found")
+		return nil, "", errors.New("manage link not found")
 	}
 
 	vals, err := url.ParseQuery(manageLink)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	req, err = http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("https://my.freenom.com/clientarea.php?managedns=%s&domainid=%s", searchDomain, vals.Get("id")), nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	resp, err = client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	recordsDoc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
+		return nil, "", err
+	}
+	return recordsDoc, vals.Get("id"), nil
+}
+
+func (p *Provider) appendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	recordsDoc, domID, err := p.getRecordsSelection(ctx, zone)
+	if err != nil {
 		return nil, err
 	}
-	return recordsDoc, nil
+
+	formDock := recordsDoc.Find("#form ").Get(0)
+
+	form := url.Values{}
+	form.Set(formDock.FirstChild.Attr[1].Val, formDock.FirstChild.Attr[2].Val)
+	form.Set(formDock.FirstChild.NextSibling.Attr[1].Val, formDock.FirstChild.NextSibling.Attr[2].Val)
+
+	for i, rec := range records {
+		form.Set(fmt.Sprintf("addrecord[%d][name]", i), rec.Name)
+		form.Set(fmt.Sprintf("addrecord[%d][type]", i), rec.Type)
+		form.Set(fmt.Sprintf("addrecord[%d][ttl]", i), strconv.Itoa(int(rec.TTL.Seconds())))
+		form.Set(fmt.Sprintf("addrecord[%d][value]", i), rec.Value)
+		form.Set(fmt.Sprintf("addrecord[%d][priority]", i), "")
+		if rec.Priority > 0 {
+			form.Set(fmt.Sprintf("addrecord[%d][priority]", i), strconv.Itoa(rec.Priority))
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("https://my.freenom.com/clientarea.php?managedns=%s&domainid=%s", zone, domID),
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+
+	return p.getExistRecords(ctx, zone, records)
+}
+
+func (p *Provider) getExistRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+
+	added := make([]libdns.Record, 0, len(records))
+	newRecs, err := p.getRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, rec := range newRecs {
+		for _, expRec := range records {
+			if rec == expRec {
+				added = append(added, rec)
+				break
+			}
+		}
+	}
+
+	return added, nil
+}
+
+func (p *Provider) setRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	recordsDoc, domID, err := p.getRecordsSelection(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	formDock := recordsDoc.Find("#recordslistform ").Get(0)
+
+	form := url.Values{}
+	form.Set(formDock.FirstChild.Attr[1].Val, formDock.FirstChild.Attr[2].Val)
+	form.Set(formDock.FirstChild.NextSibling.Attr[1].Val, formDock.FirstChild.NextSibling.Attr[2].Val)
+
+	currentRecords, err := p.getRecords(ctx, zone)
+	toAppend := make([]libdns.Record, 0, len(records))
+	unused := make(map[libdns.Record]struct{}, len(currentRecords))
+	for _, rec := range currentRecords {
+		unused[rec] = struct{}{}
+	}
+
+	for _, expRec := range records {
+		found := false
+
+		for _, rec := range currentRecords {
+			if rec.Type == expRec.Type && rec.Name == expRec.Name && (rec.TTL != expRec.TTL || rec.Value != expRec.Value || rec.Priority != expRec.Priority) {
+				form.Set(fmt.Sprintf("records[%s][name]", rec.ID), expRec.Name)
+				form.Set(fmt.Sprintf("records[%s][type]", rec.ID), expRec.Type)
+				form.Set(fmt.Sprintf("records[%s][ttl]", rec.ID), strconv.Itoa(int(expRec.TTL.Seconds())))
+				form.Set(fmt.Sprintf("records[%s][value]", rec.ID), expRec.Value)
+				form.Set(fmt.Sprintf("records[%s][priority]", rec.ID), "")
+				if rec.Priority > 0 {
+					form.Set(fmt.Sprintf("addrecord[%s][priority]", rec.ID), strconv.Itoa(expRec.Priority))
+				}
+				found = true
+				delete(unused, rec)
+				break
+			}
+		}
+		if !found {
+			toAppend = append(toAppend, expRec)
+		}
+	}
+
+	for rec := range unused {
+		form.Set(fmt.Sprintf("records[%s][name]", rec.ID), rec.Name)
+		form.Set(fmt.Sprintf("records[%s][type]", rec.ID), rec.Type)
+		form.Set(fmt.Sprintf("records[%s][ttl]", rec.ID), strconv.Itoa(int(rec.TTL.Seconds())))
+		form.Set(fmt.Sprintf("records[%s][value]", rec.ID), rec.Value)
+		form.Set(fmt.Sprintf("records[%s][priority]", rec.ID), "")
+		if rec.Priority > 0 {
+			form.Set(fmt.Sprintf("addrecord[%s][priority]", rec.ID), strconv.Itoa(rec.Priority))
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("https://my.freenom.com/clientarea.php?managedns=%s&domainid=%s", zone, domID),
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+
+	return p.getExistRecords(ctx, zone, records)
+}
+
+func (p *Provider) deleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	recs, err := p.getExistRecords(ctx, zone, records)
+
+	recordsDoc, _, err := p.getRecordsSelection(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range recs {
+		recDoc := recordsDoc.Find(
+			"#recordslistform > table:nth-child(3) > tbody:nth-child(2) > tr > .delete_column button",
+		).Get(i)
+		// if(confirm('Do you really want to remove this entry?')) location.href='/clientarea.php?managedns=domain.com&page=&records=A&dnsaction=delete&name=NC&value=199.247.29.197&line=&ttl=3600&priority=&weight=&port=&domainid=999999999
+		jsCode := recDoc.Attr[3].Val
+		href := strings.TrimLeft(jsCode, "if(confirm('Do you really want to remove this entry?')) location.href='")
+		resp, err := client.Get("https://my.freenom.com" + href)
+		if err != nil {
+			return nil, err
+		}
+		resp.Body.Close()
+	}
+
+	deleted := make([]libdns.Record, 0, len(records))
+
+	existRecs, err := p.getRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, recToDelete := range records {
+		found := false
+		for _, rec := range existRecs {
+			if rec == recToDelete {
+				break
+				found = true
+			}
+		}
+		if !found {
+			deleted = append(deleted, recToDelete)
+		}
+	}
+	return deleted, nil
+
 }
